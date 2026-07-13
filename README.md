@@ -1,3 +1,5 @@
+![cargo-overstay — reclaim stale Rust build artifacts](assets/github-banner.webp)
+
 # cargo-overstay
 
 A zero-dependency tool that keeps Rust build artifacts (`target/`
