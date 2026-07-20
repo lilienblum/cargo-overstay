@@ -1,5 +1,5 @@
-//! `cargo overstay purge`: delete every store-known build target now, then
-//! scan the filesystem for cargo targets overstay has never seen.
+//! `cargo overstay purge`: delete store-known build targets, optionally
+//! scanning the filesystem for cargo targets overstay has never seen.
 //!
 //! Deletion confidence is tiered. A dir is deleted outright only when
 //! cargo's own droppings prove cargo built it (`CACHEDIR.TAG` mentioning
@@ -13,6 +13,7 @@
 //! so running builds are skipped.
 
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -28,17 +29,56 @@ pub(crate) struct UnsureHit {
     pub size: u64,
 }
 
-pub fn run(root: Option<&Path>) -> i32 {
-    let root = match root {
-        Some(r) => r.to_path_buf(),
-        None => PathBuf::from(std::env::var("HOME").unwrap_or_default()),
+#[derive(Debug, PartialEq)]
+struct Options {
+    scan_root: Option<PathBuf>,
+}
+
+fn parse_args(args: &[OsString]) -> Result<Options, String> {
+    let mut include_untracked = false;
+    let mut root = None;
+    let mut options = true;
+    for arg in args {
+        if options && arg == OsStr::new("--") {
+            options = false;
+        } else if options && arg == OsStr::new("--include-untracked") {
+            include_untracked = true;
+        } else if options && arg.to_string_lossy().starts_with('-') {
+            return Err(format!("unknown option: {}", arg.to_string_lossy()));
+        } else if root.is_some() {
+            return Err(format!("unexpected argument: {}", arg.to_string_lossy()));
+        } else {
+            root = Some(PathBuf::from(arg));
+        }
+    }
+
+    if root.is_some() && !include_untracked {
+        return Err("a scan directory requires --include-untracked".to_string());
+    }
+    let scan_root = include_untracked
+        .then(|| root.unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default())));
+    Ok(Options { scan_root })
+}
+
+pub fn run(args: &[OsString]) -> i32 {
+    let options = match parse_args(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!(
+                "cargo-overstay: {error}\n\
+                 usage: cargo overstay purge [--include-untracked [dir]]"
+            );
+            return 2;
+        }
     };
-    if !root.is_dir() {
-        eprintln!("cargo-overstay: {} is not a directory", root.display());
-        return 2;
+    if let Some(root) = &options.scan_root {
+        if !root.is_dir() {
+            eprintln!("cargo-overstay: {} is not a directory", root.display());
+            return 2;
+        }
     }
     let store = crate::store::Store::open(&crate::paths::state_path());
-    let summary = purge(&store, &root, &mut confirm_on_stdin);
+    let summary = purge(&store, options.scan_root.as_deref(), &mut confirm_on_stdin);
     println!(
         "freed {} from {} target dir{}{}",
         crate::size::format_size(summary.freed),
@@ -81,7 +121,7 @@ fn confirm_on_stdin(hits: &[UnsureHit]) -> bool {
 
 pub(crate) fn purge(
     store: &crate::store::Store,
-    scan_root: &Path,
+    scan_root: Option<&Path>,
     confirm: &mut dyn FnMut(&[UnsureHit]) -> bool,
 ) -> Summary {
     let mut summary = Summary {
@@ -90,8 +130,8 @@ pub(crate) fn purge(
         locked: 0,
     };
 
-    // Phase 1: every target the store knows about. `seen` keeps the scan
-    // from re-finding targets this phase handled (or skipped as locked).
+    // Phase 1: every target the store knows about. `seen` keeps an optional
+    // scan from re-finding targets this phase handled (or skipped as locked).
     // Rows were recorded from real cargo runs, but the path may have been
     // reused since — a row whose dir no longer carries cargo markers is
     // demoted to the confirmation bucket rather than deleted outright.
@@ -114,12 +154,14 @@ pub(crate) fn purge(
         }
     }
 
-    // Phase 2: scan for targets the store has never seen.
-    let (sure, scanned_unsure) = scan(scan_root, &seen);
-    for target in &sure {
-        delete_target(target, &mut summary);
+    // Phase 2 is opt-in because it discovers targets outside overstay's store.
+    if let Some(scan_root) = scan_root {
+        let (sure, scanned_unsure) = scan(scan_root, &seen);
+        for target in &sure {
+            delete_target(target, &mut summary);
+        }
+        unsure.extend(scanned_unsure);
     }
-    unsure.extend(scanned_unsure);
     if !unsure.is_empty() && confirm(&unsure) {
         for hit in &unsure {
             delete_target(&hit.target, &mut summary);
@@ -252,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn purges_known_and_scanned_sure_targets() {
+    fn include_untracked_purges_tracked_and_scanned_targets() {
         let base = temp("known_sure");
         // Known project lives OUTSIDE the scan root; scanned one inside.
         let known = cargo_project(&base.join("known"));
@@ -268,12 +310,35 @@ mod tests {
             )
             .unwrap();
 
-        let summary = purge(&store, &root, &mut no_confirm);
+        let summary = purge(&store, Some(&root), &mut no_confirm);
         assert!(!known.exists());
         assert!(!found.exists());
         assert_eq!(summary.deleted, 2);
         assert!(summary.freed >= 8192);
         assert!(store.entries().is_empty());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn tracked_only_purge_leaves_untracked_target_untouched() {
+        let base = temp("tracked_only");
+        let tracked = cargo_project(&base.join("tracked"));
+        let untracked = cargo_project(&base.join("untracked"));
+        let store = Store::open(&base.join("state"));
+        store
+            .touch(
+                &base.join("tracked").to_string_lossy(),
+                &tracked.to_string_lossy(),
+                1_000,
+            )
+            .unwrap();
+
+        let summary = purge(&store, None, &mut no_confirm);
+
+        assert_eq!(
+            (tracked.exists(), untracked.exists(), summary.deleted),
+            (false, true, 1)
+        );
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -288,7 +353,7 @@ mod tests {
 
         // Declined -> survives.
         let mut asked = 0;
-        let summary = purge(&store, &base, &mut |hits| {
+        let summary = purge(&store, Some(&base), &mut |hits| {
             asked += 1;
             assert_eq!(hits.len(), 1);
             assert!(hits[0].size >= 1024);
@@ -299,7 +364,7 @@ mod tests {
         assert!(project.join("target/stuff.bin").exists());
 
         // Accepted -> deleted.
-        let summary = purge(&store, &base, &mut |_| true);
+        let summary = purge(&store, Some(&base), &mut |_| true);
         assert_eq!(summary.deleted, 1);
         assert!(!project.join("target").exists());
         fs::remove_dir_all(&base).unwrap();
@@ -313,7 +378,7 @@ mod tests {
         fs::write(junk.join("bundle.js"), vec![0u8; 1024]).unwrap();
         let store = Store::open(&base.join("state"));
 
-        let summary = purge(&store, &base, &mut no_confirm);
+        let summary = purge(&store, Some(&base), &mut no_confirm);
         assert_eq!(summary.deleted, 0);
         assert!(junk.join("bundle.js").exists());
         fs::remove_dir_all(&base).unwrap();
@@ -329,12 +394,12 @@ mod tests {
         std::os::unix::fs::symlink(base.join("outside-root"), root.join("link")).unwrap();
         let store = Store::open(&base.join("state"));
 
-        let summary = purge(&store, &base.join(".stash"), &mut no_confirm);
+        let summary = purge(&store, Some(&base.join(".stash")), &mut no_confirm);
         // Scanning an explicit root works even if the root itself is hidden…
         assert_eq!(summary.deleted, 1);
         assert!(!hidden.exists());
         // …but a scan never crosses symlinks.
-        let summary = purge(&store, &root, &mut no_confirm);
+        let summary = purge(&store, Some(&root), &mut no_confirm);
         assert_eq!(summary.deleted, 0);
         assert!(outside.exists());
         fs::remove_dir_all(&base).unwrap();
@@ -357,10 +422,7 @@ mod tests {
 
         let build = fs::File::open(target.join("debug/.cargo-lock")).unwrap();
         assert!(crate::trim::flock_exclusive_nb(&build));
-        // Scan root elsewhere so only phase 1 sees the locked target.
-        let root = base.join("empty");
-        fs::create_dir_all(&root).unwrap();
-        let summary = purge(&store, &root, &mut no_confirm);
+        let summary = purge(&store, None, &mut no_confirm);
         assert_eq!(summary.locked, 1);
         assert_eq!(summary.deleted, 0);
         assert!(target.exists());
@@ -383,13 +445,9 @@ mod tests {
                 1_000,
             )
             .unwrap();
-        // Scan root elsewhere so only phase 1 sees the row.
-        let root = base.join("empty");
-        fs::create_dir_all(&root).unwrap();
-
         // Declined -> survives, row kept.
         let mut asked = 0;
-        let summary = purge(&store, &root, &mut |hits| {
+        let summary = purge(&store, None, &mut |hits| {
             asked += 1;
             assert_eq!(hits.len(), 1);
             assert!(hits[0].size >= 2048);
@@ -401,7 +459,7 @@ mod tests {
         assert_eq!(store.entries().len(), 1);
 
         // Accepted -> deleted, row pruned.
-        let summary = purge(&store, &root, &mut |_| true);
+        let summary = purge(&store, None, &mut |_| true);
         assert_eq!(summary.deleted, 1);
         assert!(!target.exists());
         assert!(store.entries().is_empty());
@@ -424,8 +482,33 @@ mod tests {
 
         // Known target sits inside the scan root: phase 1 deletes it, the
         // scan must not report it again.
-        let summary = purge(&store, &root, &mut no_confirm);
+        let summary = purge(&store, Some(&root), &mut no_confirm);
         assert_eq!(summary.deleted, 1);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn parse_args_defaults_to_tracked_only() {
+        assert_eq!(parse_args(&[]).unwrap(), Options { scan_root: None });
+    }
+
+    #[test]
+    fn parse_args_accepts_include_untracked_with_root() {
+        let args = [
+            OsString::from("--include-untracked"),
+            OsString::from("/work"),
+        ];
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            Options {
+                scan_root: Some(PathBuf::from("/work"))
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_scan_root_without_opt_in() {
+        let error = parse_args(&[OsString::from("/work")]).unwrap_err();
+        assert_eq!(error, "a scan directory requires --include-untracked");
     }
 }

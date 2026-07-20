@@ -19,14 +19,17 @@ state starts fresh.
 ## Use it manually
 
 ```sh
-cargo overstay purge            # reclaim targets under your home directory
-cargo overstay purge ~/work     # scan a narrower location
-cargo overstay ls               # show tracked projects, sizes, and last use
+cargo overstay purge                              # reclaim tracked targets
+cargo overstay purge --include-untracked          # also scan under your home
+cargo overstay purge --include-untracked ~/work   # scan a narrower location
+cargo overstay ls                                 # show tracked projects
 ```
 
-`purge` validates Cargo targets before deleting them, asks before removing
-ambiguous matches, and skips active builds. It never follows symlinks or
-touches a scanned `target/` without a sibling `Cargo.toml`.
+By default, `purge` only considers targets recorded by the cargo shim. Pass
+`--include-untracked` to also discover Cargo targets under a directory.
+`purge` validates targets before deleting them, asks before removing ambiguous
+matches, and skips active builds. It never follows symlinks or touches a
+scanned `target/` without a sibling `Cargo.toml`.
 
 ## Enable automatic cleanup (optional)
 

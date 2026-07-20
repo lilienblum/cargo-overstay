@@ -5,17 +5,17 @@ use std::path::Path;
 
 pub(crate) fn run_cli(args: &[OsString]) -> i32 {
     match args.first().and_then(|a| a.to_str()) {
-        Some("purge") => crate::purge::run(args.get(1).map(Path::new)),
+        Some("purge") => crate::purge::run(&args[1..]),
         Some("ls") => ls(),
         _ => {
             eprintln!(
                 "usage: cargo overstay <command>\n\
                  \n\
                  commands:\n\
-                 \x20 purge [dir]  delete every known build target, then scan `dir`\n\
-                 \x20              (default: your home) and delete verified cargo\n\
-                 \x20              targets; ambiguous ones need one confirmation\n\
-                 \x20 ls           list tracked projects with target sizes and last use"
+                 \x20 purge                            delete tracked build targets\n\
+                 \x20 purge --include-untracked [dir]  also scan `dir` (default: home)\n\
+                 \x20                                  for untracked cargo targets\n\
+                 \x20 ls                               list tracked projects with sizes"
             );
             2
         }
