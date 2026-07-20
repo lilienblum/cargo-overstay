@@ -100,6 +100,13 @@ fn record_usage_and_check_due(
     if let (Some(ws), Some(target)) = (workspace, target_dir) {
         let _ = store.touch(&ws.to_string_lossy(), &target.to_string_lossy(), now);
     }
+    let policy = match crate::config::load_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("cargo-overstay: {error}; automatic cleanup disabled");
+            return false;
+        }
+    };
     let last_gc = store.last_gc();
     if crate::cleanup::should_run_gc(last_gc, now, crate::cleanup::THROTTLE_HOURS * 3600) {
         return true;
@@ -109,12 +116,7 @@ fn record_usage_and_check_due(
     let free = target_dir
         .and_then(crate::size::free_space)
         .or_else(|| cwd.and_then(crate::size::free_space));
-    crate::cleanup::should_run_gc_low_disk(
-        last_gc,
-        now,
-        free,
-        crate::cleanup::default_policy().low_disk_trigger,
-    )
+    crate::cleanup::should_run_gc_low_disk(last_gc, now, free, policy.low_disk_trigger)
 }
 
 /// Runs the throttled cleanup pass in what is meant to be a detached child
@@ -126,9 +128,13 @@ pub(crate) fn run_detached_gc(target_arg: Option<&OsStr>) -> i32 {
     let current_target = target_arg
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
+    let policy = match crate::config::load_policy() {
+        Ok(policy) => policy,
+        Err(_) => return 2,
+    };
 
     let store = crate::store::Store::open(&crate::paths::state_path());
-    crate::cleanup::run_gc(&store, current_target.as_deref(), now);
+    crate::cleanup::run_gc(&store, current_target.as_deref(), now, &policy);
     0
 }
 
@@ -143,8 +149,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state_path = dir.join("test.state");
+        let config_path = dir.join("missing-config.toml");
 
         std::env::set_var("CARGO_OVERSTAY_STATE", &state_path);
+        std::env::set_var("CARGO_OVERSTAY_CONFIG", &config_path);
         let code = run_detached_gc(None);
         assert_eq!(code, 0);
         // run_gc should have opened the store and advanced last_gc.
@@ -152,6 +160,27 @@ mod tests {
         assert!(last_gc > 0);
 
         std::env::remove_var("CARGO_OVERSTAY_STATE");
+        std::env::remove_var("CARGO_OVERSTAY_CONFIG");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_config_disables_automatic_cleanup() {
+        let _env = crate::paths::env_lock();
+        let dir = std::env::temp_dir().join(format!("overstay_badconfig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state_path = dir.join("test.state");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "max_total_size = 150").unwrap();
+        std::env::set_var("CARGO_OVERSTAY_STATE", &state_path);
+        std::env::set_var("CARGO_OVERSTAY_CONFIG", &config_path);
+
+        let due = record_usage_and_check_due(None, None, Some(&dir), 2_000_000_000);
+
+        assert!(!due);
+        std::env::remove_var("CARGO_OVERSTAY_STATE");
+        std::env::remove_var("CARGO_OVERSTAY_CONFIG");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

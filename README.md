@@ -2,9 +2,8 @@
 
 # cargo-overstay
 
-A zero-dependency tool that keeps Rust `target/` directories from filling your
-disk. Run it manually, or install its optional `cargo` shim for automatic
-cleanup.
+A small tool that keeps Rust `target/` directories from filling your disk. Run
+it manually, or install its optional `cargo` shim for automatic cleanup.
 
 ## Install
 
@@ -64,13 +63,33 @@ command -v cargo
 # ~/.cargo-overstay/bin/cargo
 ```
 
+## Configure size limits
+
+The size limits can be overridden with a TOML config file:
+
+```toml
+max_total_size = "150GiB"
+max_target_size = "25GiB"
+```
+
+The default location is `~/Library/Application Support/cargo-overstay/config.toml`
+on macOS. On Linux it is `$XDG_CONFIG_HOME/cargo-overstay/config.toml` when
+that variable is set, otherwise `~/.config/cargo-overstay/config.toml`.
+`CARGO_OVERSTAY_CONFIG` can point to a different file. Both settings are
+optional and accept binary or decimal units such as `GiB`, `GB`, and `MiB`.
+
+Invalid TOML, unknown settings, and invalid sizes are reported instead of
+silently falling back to smaller limits; automatic cleanup remains disabled
+until the config is fixed.
+
 ## Cleanup policy
 
-Automatic cleanup has fixed, configuration-free limits:
+Automatic cleanup uses these defaults:
 
 - Unused for 30 days: remove the whole target.
-- Larger than 10 GiB: trim recognized stale artifacts in place.
-- More than 75 GiB across tracked targets: remove least-recently-used targets.
+- Larger than 10 GiB (`max_target_size`): trim recognized stale artifacts in place.
+- More than 75 GiB (`max_total_size`) across tracked targets: remove
+  least-recently-used targets.
 - Less than 10 GiB free: remove least-recently-used targets until 20 GiB is free.
 
 Overstay skips active or recently used targets and takes Cargo's build lock

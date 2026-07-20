@@ -11,3 +11,4 @@ keywords = ["cargo", "cleanup", "disk", "build-artifacts", "target"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
 
 [dependencies]
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }

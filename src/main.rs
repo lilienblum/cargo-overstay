@@ -9,6 +9,7 @@ use std::path::Path;
 mod cargo;
 mod cleanup;
 mod cli;
+mod config;
 mod paths;
 mod purge;
 mod shim;

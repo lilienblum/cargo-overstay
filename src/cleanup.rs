@@ -17,6 +17,7 @@ impl Reason {
     }
 }
 
+#[derive(Debug)]
 pub struct Policy {
     pub max_total_cache: u64,
     pub max_project_size: u64,
@@ -99,7 +100,7 @@ pub fn select_evictions(
 
     // Pass 2: global budget. This is an optimistic first pass: over-cap
     // targets are counted at the size their trim is meant to reach, avoiding
-    // unnecessary whole-target eviction when trimming succeeds. `run_gc_with`
+    // unnecessary whole-target eviction when trimming succeeds. `run_gc`
     // remeasures afterward and enforces the budget against actual bytes, since
     // fresh, locked, or unrecognized artifacts can make a trim fall short.
     let total: u64 = candidates
@@ -286,9 +287,9 @@ pub struct GcReport {
     pub scanned: usize,
 }
 
-// Fixed defaults — overstay is zero-config. The size strings are the single
-// source of truth; `default_policy` parses them back into bytes.
-pub(crate) const MAX_TOTAL_CACHE_STR: &str = "75GiB";
+// Built-in defaults. The size strings are the single source of truth;
+// `default_policy` parses them back into bytes before config overrides apply.
+const MAX_TOTAL_CACHE_STR: &str = "75GiB";
 const MAX_PROJECT_SIZE_STR: &str = "10GiB";
 const INACTIVE_DAYS: i64 = 30;
 // Low-disk trigger: evict LRU on a volume once its free space falls below the
@@ -322,11 +323,7 @@ pub fn default_policy() -> Policy {
     }
 }
 
-pub fn run_gc(store: &crate::store::Store, current_target: Option<&Path>, now: i64) -> GcReport {
-    run_gc_with(store, current_target, now, &default_policy())
-}
-
-fn run_gc_with(
+pub fn run_gc(
     store: &crate::store::Store,
     current_target: Option<&Path>,
     now: i64,
@@ -629,7 +626,7 @@ mod tests {
         // `now` so the idle gate passes. The default inactive window
         // (30 days) makes /old eligible for whole-dir reclaim.
         let far = now + 10 * 86400;
-        let report = run_gc(&store, None, far);
+        let report = run_gc(&store, None, far, &default_policy());
         assert_eq!(report.scanned, 1); // stale row dropped before scan count
         assert!(report.freed >= 4096);
         assert!(!old.join("target").exists());
@@ -663,7 +660,7 @@ mod tests {
             .unwrap();
 
         let far = now + 10 * 86400;
-        let report = run_gc(&store, None, far);
+        let report = run_gc(&store, None, far, &default_policy());
         assert_eq!(report.scanned, 1);
         assert!(report.freed >= 4096);
         assert!(!custom_target.exists());
@@ -700,7 +697,7 @@ mod tests {
             low_disk_recover: 0,
         };
         let far = now + 10 * 86400;
-        let report = run_gc_with(&store, Some(&target), far, &policy);
+        let report = run_gc(&store, Some(&target), far, &policy);
         assert!(target.join("big.bin").exists());
         assert_eq!(report.freed, 0);
         std::fs::remove_dir_all(&base).unwrap();
@@ -742,7 +739,7 @@ mod tests {
             low_disk_trigger: 0,
             low_disk_recover: 0,
         };
-        let report = run_gc_with(&store, Some(&target), now, &policy);
+        let report = run_gc(&store, Some(&target), now, &policy);
         // The current target is trimmed despite being freshly modified: the
         // idle gate exists to avoid deleting another session's in-use target,
         // but trimming stale units of our own just-built target is safe.
@@ -786,7 +783,7 @@ mod tests {
             .unwrap();
 
         let policy = policy(16 * 1024, 4 * 1024, i64::MAX);
-        run_gc_with(&store, Some(&current_target), now, &policy);
+        run_gc(&store, Some(&current_target), now, &policy);
 
         assert_eq!(
             (current_target.exists(), old_target.exists()),
@@ -825,7 +822,7 @@ mod tests {
 
         let build = std::fs::File::open(target_dir(&busy).join("debug/.cargo-lock")).unwrap();
         assert!(crate::trim::flock_exclusive_nb(&build));
-        run_gc_with(&store, None, now, &policy(4096, u64::MAX, i64::MAX));
+        run_gc(&store, None, now, &policy(4096, u64::MAX, i64::MAX));
 
         assert_eq!(
             (
@@ -865,13 +862,13 @@ mod tests {
         let build = std::fs::File::open(target.join("debug/.cargo-lock")).unwrap();
         assert!(crate::trim::flock_exclusive_nb(&build));
         let far = now + 10 * 86400;
-        let report = run_gc(&store, None, far);
+        let report = run_gc(&store, None, far, &default_policy());
         assert_eq!(report.freed, 0);
         assert!(target.join("debug/big.bin").exists());
 
         // Lock released -> the next pass reclaims.
         drop(build);
-        let report = run_gc(&store, None, far);
+        let report = run_gc(&store, None, far, &default_policy());
         assert!(report.freed >= 4096);
         assert!(!target.exists());
         std::fs::remove_dir_all(&base).unwrap();
@@ -899,7 +896,7 @@ mod tests {
             .unwrap();
 
         let far = now + 10 * 86400;
-        let report = run_gc(&store, Some(&target), far);
+        let report = run_gc(&store, Some(&target), far, &default_policy());
         assert_eq!(report.evicted, 0);
         assert!(target.exists());
         std::fs::remove_dir_all(&base).unwrap();

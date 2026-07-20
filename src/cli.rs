@@ -23,6 +23,13 @@ pub(crate) fn run_cli(args: &[OsString]) -> i32 {
 }
 
 fn ls() -> i32 {
+    let policy = match crate::config::load_policy() {
+        Ok(policy) => policy,
+        Err(error) => {
+            eprintln!("cargo-overstay: {error}");
+            return 2;
+        }
+    };
     let store = crate::store::Store::open(&crate::paths::state_path());
     let now = crate::size::now_unix();
     let mut rows = store.entries();
@@ -51,7 +58,7 @@ fn ls() -> i32 {
     println!(
         "{:>10}  total (budget {})",
         crate::size::format_size(total),
-        crate::cleanup::MAX_TOTAL_CACHE_STR
+        crate::size::format_size(policy.max_total_cache)
     );
     0
 }
