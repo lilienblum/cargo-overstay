@@ -56,8 +56,11 @@ fish_add_path ~/.cargo-overstay/bin
 ```
 
 Open a new shell. Overstay now forwards every `cargo` command to the real Cargo
-and performs maintenance in the background. Keep the shim as a symlink; wrapper
-scripts can recurse and copied binaries become stale after upgrades.
+and performs maintenance in the background. After Cargo exits, the worker
+checks the tracked cache and immediately starts reclaiming if the build pushed
+it over either configured size limit. Concurrent workers are coalesced. Keep
+the shim as a symlink; wrapper scripts can recurse and copied binaries become
+stale after upgrades.
 
 Check that it is active:
 
@@ -98,6 +101,10 @@ Automatic cleanup uses these defaults:
 Overstay skips active or recently used targets and takes Cargo's build lock
 before reclaiming anything. It never removes the project currently being built;
 if that project's target exceeds 10 GiB, it only trims recognized artifacts.
+These safety rules can leave a limit temporarily unsatisfied—for example, when
+the current target alone is too large. Overstay records that condition and
+retries after 15 minutes instead of waiting for the normal six-hour maintenance
+interval.
 
 ## Uninstall
 

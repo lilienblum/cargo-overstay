@@ -62,25 +62,22 @@ pub(crate) fn passthrough(args: &[OsString]) -> i32 {
         .as_deref()
         .zip(cwd.as_deref())
         .map(|(ws, dir)| crate::cargo::invocation_target_dir(&lossy_args, dir, ws));
-    let now = crate::size::now_unix();
-
-    // Best-effort, single store open: record usage and check whether throttled
-    // cleanup is due. Never blocks or fails the build.
-    let due = record_usage_and_check_due(
+    // Record usage before Cargo runs so a concurrently finishing worker sees
+    // this target as current. Invalid config disables automatic cleanup but
+    // never blocks the actual Cargo command.
+    let cleanup_enabled = record_usage_and_validate_config(
         workspace.as_deref(),
         target_dir.as_deref(),
-        cwd.as_deref(),
-        now,
+        crate::size::now_unix(),
     );
 
     // Run the real cargo and remember its exit code.
     let code = crate::cargo::run(&cargo, args).unwrap_or(1);
 
-    // Best-effort: hand off cleanup to a detached child so the prompt returns
-    // immediately. The child re-execs this same binary with a hidden verb; we
-    // deliberately do not wait on it (its parent exiting right after is fine
-    // on unix — init reaps it).
-    if due {
+    // Every configured invocation hands post-build scheduling to a detached
+    // worker. A nonblocking maintenance lock coalesces concurrent workers; the
+    // winner performs cheap throttle checks before any filesystem walk.
+    if cleanup_enabled {
         let target_arg = target_dir
             .map(std::path::PathBuf::into_os_string)
             .unwrap_or_default();
@@ -96,55 +93,53 @@ pub(crate) fn passthrough(args: &[OsString]) -> i32 {
     code
 }
 
-fn record_usage_and_check_due(
+fn record_usage_and_validate_config(
     workspace: Option<&std::path::Path>,
     target_dir: Option<&std::path::Path>,
-    cwd: Option<&std::path::Path>,
     now: i64,
 ) -> bool {
     let store = crate::store::Store::open(&crate::paths::state_path());
     if let (Some(ws), Some(target)) = (workspace, target_dir) {
         let _ = store.touch(&ws.to_string_lossy(), &target.to_string_lossy(), now);
     }
-    let policy = match crate::config::load_policy() {
-        Ok(policy) => policy,
+    match crate::config::load_policy() {
+        Ok(_) => true,
         Err(error) => {
             let style = crate::style::Style::stderr();
             eprintln!(
                 "{} {error}; automatic cleanup disabled",
                 style.error("cargo-overstay:")
             );
-            return false;
+            false
         }
-    };
-    let last_gc = store.last_gc();
-    if crate::cleanup::should_run_gc(last_gc, now, crate::cleanup::THROTTLE_HOURS * 3600) {
-        return true;
     }
-    // Inside the normal throttle window, still run if the disk is low. Probe
-    // the target dir, falling back to the cwd (the target may not exist yet).
-    let free = target_dir
-        .and_then(crate::size::free_space)
-        .or_else(|| cwd.and_then(crate::size::free_space));
-    crate::cleanup::should_run_gc_low_disk(last_gc, now, free, policy.low_disk_trigger)
 }
 
 /// Runs the throttled cleanup pass in what is meant to be a detached child
 /// process (spawned by `passthrough`, never waited on). Best-effort end to
-/// end: nothing is watching this process's exit code anyway. `run_gc` itself
-/// updates `last_gc`, so the next invocation sees cleanup as not due.
+/// end: nothing is watching this process's exit code anyway.
 pub(crate) fn run_detached_gc(target_arg: Option<&OsStr>) -> i32 {
-    let now = crate::size::now_unix();
+    let store = crate::store::Store::open(&crate::paths::state_path());
+    let Ok(Some(_maintenance_lock)) = store.try_maintenance_lock() else {
+        return 0;
+    };
     let current_target = target_arg
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from);
     let policy = match crate::config::load_policy() {
         Ok(policy) => policy,
-        Err(_) => return 2,
+        Err(_) => return 0,
     };
+    let cwd = std::env::current_dir().ok();
+    let probe_path = current_target.as_deref().or(cwd.as_deref());
 
-    let store = crate::store::Store::open(&crate::paths::state_path());
-    crate::cleanup::run_gc(&store, current_target.as_deref(), now, &policy);
+    crate::cleanup::run_scheduled_gc(
+        &store,
+        current_target.as_deref(),
+        probe_path,
+        crate::size::now_unix(),
+        &policy,
+    );
     0
 }
 
@@ -166,7 +161,9 @@ mod tests {
         let code = run_detached_gc(None);
         assert_eq!(code, 0);
         // run_gc should have opened the store and advanced last_gc.
-        let last_gc = crate::store::Store::open(&state_path).last_gc();
+        let last_gc = crate::store::Store::open(&state_path)
+            .maintenance_state()
+            .last_gc;
         assert!(last_gc > 0);
 
         std::env::remove_var("CARGO_OVERSTAY_STATE");
@@ -186,9 +183,9 @@ mod tests {
         std::env::set_var("CARGO_OVERSTAY_STATE", &state_path);
         std::env::set_var("CARGO_OVERSTAY_CONFIG", &config_path);
 
-        let due = record_usage_and_check_due(None, None, Some(&dir), 2_000_000_000);
+        let enabled = record_usage_and_validate_config(None, None, 2_000_000_000);
 
-        assert!(!due);
+        assert!(!enabled);
         std::env::remove_var("CARGO_OVERSTAY_STATE");
         std::env::remove_var("CARGO_OVERSTAY_CONFIG");
         std::fs::remove_dir_all(&dir).unwrap();

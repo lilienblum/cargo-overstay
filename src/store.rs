@@ -8,13 +8,20 @@ pub struct Entry {
     pub last_used: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceState {
+    pub last_gc: i64,
+    pub budget_pending: bool,
+}
+
 /// A tiny persistent `target_dir -> (path, last_used)` map plus a `last_gc`
 /// timestamp, stored as a text file and guarded by a std advisory file lock so
 /// concurrent overstay processes (one per `cargo` invocation) never corrupt or
 /// clobber it.
 ///
-/// File format: line 1 is `last_gc` (an integer); each remaining line is
-/// `<last_used>\t<path>\t<target_dir>`.
+/// File format: line 1 is `<last_gc>\t<budget_pending>`; each remaining line
+/// is `<last_used>\t<path>\t<target_dir>`. Legacy integer-only headers are
+/// accepted with `budget_pending` defaulting to false.
 ///
 /// Older state files used `<last_used>\t<path>` and are still accepted; their
 /// target directory is interpreted as `<path>/target`.
@@ -39,16 +46,13 @@ impl Store {
     /// writers replace the file atomically via rename, so a reader always sees
     /// a complete old or new file, never a partial one. Malformed lines are
     /// skipped (best-effort).
-    fn read(&self) -> (i64, Vec<Entry>) {
+    fn read(&self) -> (MaintenanceState, Vec<Entry>) {
         let content = match std::fs::read_to_string(&self.path) {
-            Ok(c) => c,
-            Err(_) => return (0, Vec::new()),
+            Ok(content) => content,
+            Err(_) => return (MaintenanceState::default(), Vec::new()),
         };
         let mut lines = content.lines();
-        let last_gc = lines
-            .next()
-            .and_then(|l| l.trim().parse::<i64>().ok())
-            .unwrap_or(0);
+        let maintenance = lines.next().map(parse_maintenance).unwrap_or_default();
         let mut entries = Vec::new();
         for line in lines {
             let Some(entry) = parse_entry(line) else {
@@ -65,10 +69,10 @@ impl Store {
                 entries.push(entry);
             }
         }
-        (last_gc, entries)
+        (maintenance, entries)
     }
 
-    pub fn last_gc(&self) -> i64 {
+    pub fn maintenance_state(&self) -> MaintenanceState {
         self.read().0
     }
 
@@ -90,7 +94,7 @@ impl Store {
     fn with_lock(
         &self,
         blocking: bool,
-        edit: impl FnOnce(&mut i64, &mut Vec<Entry>),
+        edit: impl FnOnce(&mut MaintenanceState, &mut Vec<Entry>),
     ) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -127,15 +131,17 @@ impl Store {
                 return Ok(()); // skip, best-effort
             }
         }
-        let (mut last_gc, mut entries) = self.read();
-        edit(&mut last_gc, &mut entries);
-        self.write_atomic(last_gc, &entries)
+        let (mut maintenance, mut entries) = self.read();
+        edit(&mut maintenance, &mut entries);
+        self.write_atomic(maintenance, &entries)
     }
 
-    fn write_atomic(&self, last_gc: i64, entries: &[Entry]) -> io::Result<()> {
+    fn write_atomic(&self, maintenance: MaintenanceState, entries: &[Entry]) -> io::Result<()> {
         let tmp = self.path.with_extension("tmp");
         let mut buf = String::new();
-        buf.push_str(&last_gc.to_string());
+        buf.push_str(&maintenance.last_gc.to_string());
+        buf.push('\t');
+        buf.push(if maintenance.budget_pending { '1' } else { '0' });
         buf.push('\n');
         for e in entries {
             buf.push_str(&e.last_used.to_string());
@@ -159,7 +165,7 @@ impl Store {
     /// Non-blocking: on the build's critical path, so it skips (best-effort)
     /// rather than wait if the lock is held.
     pub fn touch(&self, path: &str, target_dir: &str, now: i64) -> io::Result<()> {
-        self.with_lock(false, |_last_gc, entries| {
+        self.with_lock(false, |_maintenance, entries| {
             if let Some(e) = entries.iter_mut().find(|e| e.target_dir == target_dir) {
                 e.path = path.to_string();
                 e.last_used = now;
@@ -173,21 +179,62 @@ impl Store {
         })
     }
 
-    pub fn set_last_gc(&self, now: i64) -> io::Result<()> {
-        self.with_lock(true, |last_gc, _entries| *last_gc = now)
+    pub fn finish_maintenance(
+        &self,
+        now: i64,
+        budget_pending: bool,
+        removed_targets: &[String],
+    ) -> io::Result<()> {
+        self.with_lock(true, |maintenance, entries| {
+            *maintenance = MaintenanceState {
+                last_gc: now,
+                budget_pending,
+            };
+            entries.retain(|entry| {
+                !removed_targets
+                    .iter()
+                    .any(|target| target == &entry.target_dir)
+            });
+        })
     }
 
     pub fn remove_targets(&self, target_dirs: &[String]) -> io::Result<()> {
         if target_dirs.is_empty() {
             return Ok(());
         }
-        self.with_lock(true, |_last_gc, entries| {
+        self.with_lock(true, |_maintenance, entries| {
             entries.retain(|e| {
                 !target_dirs
                     .iter()
                     .any(|target_dir| target_dir == &e.target_dir)
             });
         })
+    }
+
+    /// Coalesces detached maintenance workers without holding the short-lived
+    /// state-file lock during filesystem walks.
+    pub fn try_maintenance_lock(&self) -> io::Result<Option<File>> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.path.with_extension("gc.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+}
+
+fn parse_maintenance(line: &str) -> MaintenanceState {
+    let mut parts = line.splitn(2, '\t');
+    MaintenanceState {
+        last_gc: parts
+            .next()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or_default(),
+        budget_pending: parts.next().is_some_and(|value| value.trim() == "1"),
     }
 }
 
@@ -236,7 +283,7 @@ mod tests {
         assert_eq!(a.target_dir, "a/target");
         assert_eq!(b.last_used, 150);
         assert_eq!(b.target_dir, "b/target");
-        assert_eq!(store.last_gc(), 0);
+        assert_eq!(store.maintenance_state().last_gc, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -272,12 +319,18 @@ mod tests {
     }
 
     #[test]
-    fn set_last_gc_and_touch_preserve_each_other() {
+    fn maintenance_state_and_touch_preserve_each_other() {
         let (store, dir) = temp_store("preserve");
         store.touch("a", "a/target", 100).unwrap();
-        store.set_last_gc(500).unwrap();
+        store.finish_maintenance(500, true, &[]).unwrap();
         store.touch("b", "b/target", 200).unwrap();
-        assert_eq!(store.last_gc(), 500);
+        assert_eq!(
+            store.maintenance_state(),
+            MaintenanceState {
+                last_gc: 500,
+                budget_pending: true
+            }
+        );
         let entries = store.entries();
         assert_eq!(entries.len(), 2);
         assert!(entries
@@ -340,6 +393,7 @@ mod tests {
         std::fs::write(&store.path, "0\n123\t/work/proj\n").unwrap();
 
         let entries = store.entries();
+        assert_eq!(store.maintenance_state(), MaintenanceState::default());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "/work/proj");
         assert_eq!(entries[0].target_dir, "/work/proj/target");
@@ -370,8 +424,41 @@ mod tests {
             std::env::temp_dir().join(format!("overstay_store_{}_nonexistent", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::open(&dir.join("state"));
-        assert_eq!(store.last_gc(), 0);
+        assert_eq!(store.maintenance_state().last_gc, 0);
         assert!(store.entries().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maintenance_lock_coalesces_workers() {
+        let (store, dir) = temp_store("maintenance_lock");
+        let first = store.try_maintenance_lock().unwrap().unwrap();
+
+        assert!(store.try_maintenance_lock().unwrap().is_none());
+        drop(first);
+        assert!(store.try_maintenance_lock().unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finish_maintenance_updates_state_and_removes_targets_atomically() {
+        let (store, dir) = temp_store("finish_maintenance");
+        store.touch("a", "a/target", 100).unwrap();
+        store.touch("b", "b/target", 200).unwrap();
+
+        store
+            .finish_maintenance(500, true, &["a/target".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            store.maintenance_state(),
+            MaintenanceState {
+                last_gc: 500,
+                budget_pending: true
+            }
+        );
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].target_dir, "b/target");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
