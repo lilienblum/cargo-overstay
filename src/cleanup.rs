@@ -97,10 +97,11 @@ pub fn select_evictions(
         }
     }
 
-    // Pass 2: global budget. Over-cap targets are counted at their post-trim
-    // size (the cap) — the trim will shrink them anyway, so charging their
-    // full size would evict other projects' whole targets to recover space
-    // the trim frees regardless. Only full reclaims count toward freed.
+    // Pass 2: global budget. This is an optimistic first pass: over-cap
+    // targets are counted at the size their trim is meant to reach, avoiding
+    // unnecessary whole-target eviction when trimming succeeds. `run_gc_with`
+    // remeasures afterward and enforces the budget against actual bytes, since
+    // fresh, locked, or unrecognized artifacts can make a trim fall short.
     let total: u64 = candidates
         .iter()
         .filter(|c| !is_current(c))
@@ -234,6 +235,50 @@ fn reclaim(
     }
 }
 
+/// Remeasures surviving targets after the planned cleanup and removes LRU
+/// targets until their actual combined size fits the global budget. The
+/// current target contributes to the total but is never removed, so callers
+/// can observe a remaining excess when protected data alone exceeds the cap.
+fn enforce_total_budget(
+    candidates: &[Candidate],
+    policy: &Policy,
+    current_target: Option<&Path>,
+    now: i64,
+) -> (u64, usize) {
+    let is_current = |c: &Candidate| current_target.is_some_and(|p| p == c.target_dir);
+    let mut remaining: Vec<(&Candidate, u64)> = candidates
+        .iter()
+        .filter(|c| c.target_dir.is_dir())
+        .map(|c| (c, crate::size::dir_size(&c.target_dir)))
+        .collect();
+    let mut total: u64 = remaining.iter().map(|(_, size)| size).sum();
+    remaining.sort_by_key(|(c, _)| c.last_used);
+
+    let mut freed = 0u64;
+    let mut evicted = 0usize;
+    for (candidate, size) in remaining {
+        if total <= policy.max_total_cache {
+            break;
+        }
+        if is_current(candidate) || !is_target_evictable(&candidate.target_dir, now, MIN_IDLE_SECS)
+        {
+            continue;
+        }
+        let reclaimed = reclaim(
+            &candidate.target_dir,
+            &Reason::OverBudget,
+            size,
+            policy,
+            now,
+            false,
+        );
+        total = total.saturating_sub(reclaimed);
+        freed += reclaimed;
+        evicted += 1;
+    }
+    (freed, evicted)
+}
+
 #[allow(dead_code)]
 pub struct GcReport {
     pub freed: u64,
@@ -338,6 +383,14 @@ fn run_gc_with(
         freed += reclaim(&ev.target_dir, &ev.reason, size, policy, now, is_current);
         evicted += 1;
     }
+
+    // Trimming is deliberately best-effort: it cannot touch fresh, locked, or
+    // unrecognized artifacts. Base the hard-budget fallback on a fresh walk,
+    // not the optimistic per-project caps used during selection.
+    let (budget_freed, budget_evicted) =
+        enforce_total_budget(&candidates, policy, current_target, now);
+    freed += budget_freed;
+    evicted += budget_evicted;
 
     // Prune rows whose target no longer exists: the originally-missing ones plus
     // any we just fully reclaimed. Then record the run. Both are best-effort.
@@ -697,6 +750,92 @@ mod tests {
         assert!(!deps.join("libold-aaaaaaaaaaaaaaaa.rlib").exists());
         assert!(target.join("big.bin").exists()); // trimmed, not rm'd
         assert!(report.freed >= 4096);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn run_gc_enforces_budget_after_trim_falls_short() {
+        use crate::store::Store;
+        let base =
+            std::env::temp_dir().join(format!("overstay_gc_budget_trim_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let current = base.join("current");
+        let current_target = target_dir(&current);
+        let old = base.join("old");
+        let old_target = target_dir(&old);
+        std::fs::create_dir_all(&current_target).unwrap();
+        std::fs::create_dir_all(&old_target).unwrap();
+        std::fs::write(current_target.join("keep.bin"), vec![0u8; 12 * 1024]).unwrap();
+        std::fs::write(old_target.join("drop.bin"), vec![0u8; 8 * 1024]).unwrap();
+
+        let store = Store::open(&base.join("state"));
+        let now = 2_000_000_000i64;
+        store
+            .touch(
+                &current.to_string_lossy(),
+                &current_target.to_string_lossy(),
+                now,
+            )
+            .unwrap();
+        store
+            .touch(
+                &old.to_string_lossy(),
+                &old_target.to_string_lossy(),
+                now - 1,
+            )
+            .unwrap();
+
+        let policy = policy(16 * 1024, 4 * 1024, i64::MAX);
+        run_gc_with(&store, Some(&current_target), now, &policy);
+
+        assert_eq!(
+            (current_target.exists(), old_target.exists()),
+            (true, false)
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn run_gc_keeps_eviction_until_budget_when_lru_target_is_locked() {
+        use crate::store::Store;
+        let base =
+            std::env::temp_dir().join(format!("overstay_gc_budget_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let busy = base.join("busy");
+        let middle = base.join("middle");
+        let newest = base.join("newest");
+        for project in [&busy, &middle, &newest] {
+            let target = target_dir(project);
+            std::fs::create_dir_all(target.join("debug/.fingerprint")).unwrap();
+            std::fs::write(target.join("blob.bin"), vec![0u8; 4096]).unwrap();
+        }
+        std::fs::write(target_dir(&busy).join("debug/.cargo-lock"), b"").unwrap();
+
+        let store = Store::open(&base.join("state"));
+        let now = 2_000_000_000i64;
+        for (project, age) in [(&busy, 30), (&middle, 20), (&newest, 10)] {
+            store
+                .touch(
+                    &project.to_string_lossy(),
+                    &target_dir(project).to_string_lossy(),
+                    now - age,
+                )
+                .unwrap();
+        }
+
+        let build = std::fs::File::open(target_dir(&busy).join("debug/.cargo-lock")).unwrap();
+        assert!(crate::trim::flock_exclusive_nb(&build));
+        run_gc_with(&store, None, now, &policy(4096, u64::MAX, i64::MAX));
+
+        assert_eq!(
+            (
+                target_dir(&busy).exists(),
+                target_dir(&middle).exists(),
+                target_dir(&newest).exists(),
+            ),
+            (true, false, false)
+        );
+        drop(build);
         std::fs::remove_dir_all(&base).unwrap();
     }
 
