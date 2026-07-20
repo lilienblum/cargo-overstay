@@ -61,55 +61,71 @@ fn parse_args(args: &[OsString]) -> Result<Options, String> {
 }
 
 pub fn run(args: &[OsString]) -> i32 {
+    let style = crate::style::Style::stdout();
     let options = match parse_args(args) {
         Ok(options) => options,
         Err(error) => {
+            let error_style = crate::style::Style::stderr();
             eprintln!(
-                "cargo-overstay: {error}\n\
-                 usage: cargo overstay purge [--include-untracked [dir]]"
+                "{} {error}\n{} {}",
+                error_style.error("cargo-overstay:"),
+                error_style.heading("Usage:"),
+                error_style.command("cargo overstay purge [--include-untracked [dir]]")
             );
             return 2;
         }
     };
     if let Some(root) = &options.scan_root {
         if !root.is_dir() {
-            eprintln!("cargo-overstay: {} is not a directory", root.display());
+            let error_style = crate::style::Style::stderr();
+            eprintln!(
+                "{} {} is not a directory",
+                error_style.error("cargo-overstay:"),
+                error_style.path(root.display())
+            );
             return 2;
         }
     }
     let store = crate::store::Store::open(&crate::paths::state_path());
     let summary = purge(&store, options.scan_root.as_deref(), &mut confirm_on_stdin);
+    let locked = if summary.locked > 0 {
+        format!(
+            " {}",
+            style.warning(format!("({} skipped: build running)", summary.locked))
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "freed {} from {} target dir{}{}",
-        crate::size::format_size(summary.freed),
-        summary.deleted,
+        "{} from {} target dir{}{}",
+        style.success(format!("freed {}", crate::size::format_size(summary.freed))),
+        style.strong(summary.deleted),
         if summary.deleted == 1 { "" } else { "s" },
-        if summary.locked > 0 {
-            format!(" ({} skipped: build running)", summary.locked)
-        } else {
-            String::new()
-        },
+        locked,
     );
     0
 }
 
 fn confirm_on_stdin(hits: &[UnsureHit]) -> bool {
+    let style = crate::style::Style::stdout();
     let total: u64 = hits.iter().map(|h| h.size).sum();
+    println!("\n{}", style.heading("Unverified targets"));
     println!(
-        "\n{} target dir{} without cargo build markers:",
-        hits.len(),
+        "{} target dir{} without cargo build markers:",
+        style.warning(hits.len()),
         if hits.len() == 1 { "" } else { "s" }
     );
     for h in hits {
         println!(
-            "  {:>10}  {}",
-            crate::size::format_size(h.size),
-            h.target.display()
+            "  {}  {}",
+            style.accent(format!("{:>10}", crate::size::format_size(h.size))),
+            style.path(h.target.display())
         );
     }
     print!(
-        "delete these too? ({} total) [y/N] ",
-        crate::size::format_size(total)
+        "{} {} ",
+        style.strong("Delete these too?"),
+        style.muted(format!("({} total) [y/N]", crate::size::format_size(total)))
     );
     let _ = std::io::stdout().flush();
     let mut line = String::new();
@@ -181,11 +197,13 @@ pub(crate) fn purge(
 
 /// rm -rf one target behind cargo's build lock; prints what happened.
 fn delete_target(target: &Path, summary: &mut Summary) {
+    let style = crate::style::Style::stdout();
     let Some(_locks) = crate::trim::lock_target(target) else {
         println!(
-            "{:>10}  {}  (skipped: build running)",
-            "-",
-            target.display()
+            "{}  {}  {}",
+            style.warning(format!("{:>10}", "-")),
+            style.path(target.display()),
+            style.warning("(skipped: build running)")
         );
         summary.locked += 1;
         return;
@@ -194,9 +212,9 @@ fn delete_target(target: &Path, summary: &mut Summary) {
     let _ = std::fs::remove_dir_all(target);
     let freed = before.saturating_sub(crate::size::dir_size(target));
     println!(
-        "{:>10}  {}",
-        crate::size::format_size(freed),
-        target.display()
+        "{}  {}",
+        style.success(format!("{:>10}", crate::size::format_size(freed))),
+        style.path(target.display())
     );
     summary.freed += freed;
     summary.deleted += 1;

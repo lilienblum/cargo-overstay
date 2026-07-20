@@ -30,6 +30,9 @@ By default, `purge` only considers targets recorded by the cargo shim. Pass
 matches, and skips active builds. It never follows symlinks or touches a
 scanned `target/` without a sibling `Cargo.toml`.
 
+Output is colored when connected to a terminal and stays plain when piped or
+redirected. Set [`NO_COLOR`](https://no-color.org/) to disable colors.
+
 ## Enable automatic cleanup (optional)
 
 Create a `cargo` symlink to overstay in a dedicated directory:

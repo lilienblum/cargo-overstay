@@ -15,6 +15,7 @@ mod purge;
 mod shim;
 mod size;
 mod store;
+mod style;
 #[cfg(test)]
 mod testutil;
 mod trim;

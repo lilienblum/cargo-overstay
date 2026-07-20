@@ -25,9 +25,11 @@ pub(crate) fn passthrough(args: &[OsString]) -> i32 {
     let self_exe = match std::env::current_exe() {
         Ok(p) if !p.as_os_str().is_empty() => p,
         _ => {
+            let style = crate::style::Style::stderr();
             eprintln!(
-                "cargo-overstay: cannot determine own executable path; \
-                 refusing to search for the real `cargo`"
+                "{} cannot determine own executable path; \
+                 refusing to search for the real `cargo`",
+                style.error("cargo-overstay:")
             );
             return 127;
         }
@@ -37,7 +39,11 @@ pub(crate) fn passthrough(args: &[OsString]) -> i32 {
     let cargo = match crate::cargo::find_real_cargo(&self_exe, &path_var) {
         Some(c) => c,
         None => {
-            eprintln!("cargo-overstay: could not find the real `cargo` on PATH");
+            let style = crate::style::Style::stderr();
+            eprintln!(
+                "{} could not find the real `cargo` on PATH",
+                style.error("cargo-overstay:")
+            );
             return 127;
         }
     };
@@ -103,7 +109,11 @@ fn record_usage_and_check_due(
     let policy = match crate::config::load_policy() {
         Ok(policy) => policy,
         Err(error) => {
-            eprintln!("cargo-overstay: {error}; automatic cleanup disabled");
+            let style = crate::style::Style::stderr();
+            eprintln!(
+                "{} {error}; automatic cleanup disabled",
+                style.error("cargo-overstay:")
+            );
             return false;
         }
     };
