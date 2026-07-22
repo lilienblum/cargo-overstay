@@ -11,10 +11,6 @@ it manually, or install its optional `cargo` shim for automatic cleanup.
 cargo install cargo-overstay
 ```
 
-Upgrading from the old `overstay` crate? First run `cargo uninstall overstay`,
-remove its shim and `~/.overstay`, then repeat the shim setup below. Tracking
-state starts fresh.
-
 ## Use it manually
 
 ```sh
